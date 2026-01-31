@@ -3,6 +3,7 @@ import { Inter } from "next/font/google";
 import "./globals.css";
 import { Providers } from "@/components/Providers";
 import { Header } from "@/components/Header";
+import { AIWarningBanner, AIWarningModal } from "@/components/AIWarningBanner";
 
 const inter = Inter({ subsets: ["latin"] });
 
@@ -23,6 +24,9 @@ export default function RootLayout({
     <html lang="en" className="dark">
       <body className={`${inter.className} bg-zinc-950 text-zinc-100 min-h-screen`}>
         <Providers>
+          {/* AI Warning - Modal on first visit, banner after dismissed */}
+          <AIWarningModal />
+          <AIWarningBanner />
           <Header />
           <main className="container mx-auto px-4 py-8">
             {children}
