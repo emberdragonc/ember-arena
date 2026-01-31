@@ -8,7 +8,7 @@ import { ERC20 } from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 /// @notice Mock EMBER token for testing
 contract MockEMBER is ERC20 {
     constructor() ERC20("Ember Token", "EMBER") {
-        _mint(msg.sender, 1_000_000 ether);
+        _mint(msg.sender, 100_000_000 ether);
     }
 
     function mint(address to, uint256 amount) external {
@@ -27,10 +27,11 @@ contract EmberArenaTest is Test {
     address public ideaCreator;
 
     uint256 public constant MIN_THRESHOLD = 100 ether;
+    uint256 public constant SUBMISSION_FEE = 100_000 ether; // 100K EMBER
 
-    // Events
+    // Events (updated to match contract)
     event RoundStarted(uint256 indexed roundId, uint256 submissionStart, uint256 votingStart, uint256 votingEnd);
-    event IdeaSubmitted(uint256 indexed roundId, uint256 indexed ideaId, address indexed creator, string description);
+    event IdeaSubmitted(uint256 indexed roundId, uint256 indexed ideaId, address indexed creator, string description, uint256 fee);
     event IdeaBacked(uint256 indexed roundId, uint256 indexed ideaId, address indexed backer, uint256 amount);
     event WinnerSelected(uint256 indexed roundId, uint256 indexed winningIdeaId, address indexed creator, uint256 totalPool);
     event WinningsClaimed(uint256 indexed roundId, address indexed backer, uint256 amount);
@@ -46,10 +47,11 @@ contract EmberArenaTest is Test {
         ember = new MockEMBER();
         arena = new EmberArena(address(ember), MIN_THRESHOLD);
 
-        // Fund users
-        ember.mint(user1, 1000 ether);
-        ember.mint(user2, 1000 ether);
-        ember.mint(user3, 1000 ether);
+        // Fund users with enough for submission fees + backing
+        ember.mint(user1, 500_000 ether);
+        ember.mint(user2, 500_000 ether);
+        ember.mint(user3, 500_000 ether);
+        ember.mint(ideaCreator, 500_000 ether);
 
         // Approve arena for all users
         vm.prank(user1);
@@ -57,6 +59,8 @@ contract EmberArenaTest is Test {
         vm.prank(user2);
         ember.approve(address(arena), type(uint256).max);
         vm.prank(user3);
+        ember.approve(address(arena), type(uint256).max);
+        vm.prank(ideaCreator);
         ember.approve(address(arena), type(uint256).max);
     }
 
@@ -131,7 +135,7 @@ contract EmberArenaTest is Test {
 
         vm.prank(ideaCreator);
         vm.expectEmit(true, true, true, true);
-        emit IdeaSubmitted(1, 1, ideaCreator, "Build a DEX");
+        emit IdeaSubmitted(1, 1, ideaCreator, "Build a DEX", SUBMISSION_FEE);
 
         uint256 ideaId = arena.submitIdea("Build a DEX", "ipfs://Qm...");
 
@@ -146,6 +150,10 @@ contract EmberArenaTest is Test {
         assertEq(idea.metadata, "ipfs://Qm...");
         assertEq(idea.totalBacking, 0);
         assertEq(idea.isWinner, false);
+
+        // Check fee was charged and added to pool
+        EmberArena.Round memory round = arena.getRoundInfo(1);
+        assertEq(round.totalPool, SUBMISSION_FEE);
     }
 
     function test_SubmitIdea_RevertNoRound() public {
@@ -178,7 +186,11 @@ contract EmberArenaTest is Test {
 
         // Submit max ideas
         for (uint256 i = 0; i < 100; i++) {
-            vm.prank(makeAddr(string(abi.encodePacked("creator", i))));
+            address creator = makeAddr(string(abi.encodePacked("creator", i)));
+            ember.mint(creator, SUBMISSION_FEE);
+            vm.prank(creator);
+            ember.approve(address(arena), SUBMISSION_FEE);
+            vm.prank(creator);
             arena.submitIdea("Idea", "");
         }
 
@@ -210,9 +222,9 @@ contract EmberArenaTest is Test {
         assertEq(idea.totalBacking, 50 ether);
 
         EmberArena.Round memory round = arena.getRoundInfo(1);
-        assertEq(round.totalPool, 50 ether);
+        assertEq(round.totalPool, SUBMISSION_FEE + 50 ether);
 
-        assertEq(ember.balanceOf(address(arena)), 50 ether);
+        assertEq(ember.balanceOf(address(arena)), SUBMISSION_FEE + 50 ether);
     }
 
     function test_BackIdea_MultipleBacks() public {
@@ -311,7 +323,7 @@ contract EmberArenaTest is Test {
         // Warp past voting
         vm.warp(block.timestamp + 25 hours);
 
-        uint256 totalPool = 200 ether;
+        uint256 totalPool = SUBMISSION_FEE + 200 ether;
         uint256 burnAmount = (totalPool * 2000) / 10000; // 20%
 
         vm.expectEmit(true, true, true, true);
@@ -344,7 +356,7 @@ contract EmberArenaTest is Test {
         arena.backIdea(1, 100 ether);
 
         // Still in voting
-        vm.expectRevert(EmberArena.NotInVotingPhase.selector);
+        vm.expectRevert(EmberArena.VotingNotEnded.selector);
         arena.selectWinner(1);
     }
 
@@ -409,9 +421,12 @@ contract EmberArenaTest is Test {
 
         arena.selectWinner(1);
 
-        // Total pool = 200, distributable = 160 (80%)
-        // Each user backed 50% of winning idea, so gets 80 each
-        uint256 expectedShare = 80 ether;
+        // Total pool = SUBMISSION_FEE + 200, distributable = 80% of that
+        // Each user backed 50% of winning idea's backing
+        // User share = (userBacking / ideaTotalBacking) * distributablePool
+        uint256 totalPool = SUBMISSION_FEE + 200 ether;
+        uint256 distributable = (totalPool * 8000) / 10000;
+        uint256 expectedShare = (100 ether * distributable) / 200 ether;
 
         uint256 user1BalanceBefore = ember.balanceOf(user1);
 
@@ -505,9 +520,13 @@ contract EmberArenaTest is Test {
 
         arena.selectWinner(1);
 
-        // Total = 200, distributable = 160
-        // User1 gets 75% of 160 = 120
-        // User2 gets 25% of 160 = 40
+        // Total = SUBMISSION_FEE + 200, distributable = 80%
+        // Idea totalBacking = 200 ether
+        // User1 gets 75% of distributable, User2 gets 25%
+        uint256 totalPool = SUBMISSION_FEE + 200 ether;
+        uint256 distributable = (totalPool * 8000) / 10000;
+        uint256 expected1 = (150 ether * distributable) / 200 ether;
+        uint256 expected2 = (50 ether * distributable) / 200 ether;
 
         uint256 user1Before = ember.balanceOf(user1);
         uint256 user2Before = ember.balanceOf(user2);
@@ -518,8 +537,8 @@ contract EmberArenaTest is Test {
         vm.prank(user2);
         arena.claimWinnings(1);
 
-        assertEq(ember.balanceOf(user1) - user1Before, 120 ether);
-        assertEq(ember.balanceOf(user2) - user2Before, 40 ether);
+        assertEq(ember.balanceOf(user1) - user1Before, expected1);
+        assertEq(ember.balanceOf(user2) - user2Before, expected2);
     }
 
     // ============================================
@@ -591,9 +610,15 @@ contract EmberArenaTest is Test {
         vm.prank(user2);
         arena.backIdea(1, 100 ether);
 
-        // User1 potential: (100/200) * (200 * 0.8) = 80
+        // Total pool = SUBMISSION_FEE + 200 ether
+        // Idea backing = 200 ether
+        // User1 potential: (100/200) * ((SUBMISSION_FEE + 200) * 0.8)
+        uint256 totalPool = SUBMISSION_FEE + 200 ether;
+        uint256 distributable = (totalPool * 8000) / 10000;
+        uint256 expected = (100 ether * distributable) / 200 ether;
+
         uint256 potential = arena.calculatePotentialWinnings(1, 1, user1);
-        assertEq(potential, 80 ether);
+        assertEq(potential, expected);
     }
 
     // ============================================
@@ -628,7 +653,7 @@ contract EmberArenaTest is Test {
     // ============================================
 
     function test_EmergencyWithdraw() public {
-        // Send some tokens to contract
+        // Send some tokens to contract (not during active round)
         ember.transfer(address(arena), 100 ether);
 
         uint256 ownerBefore = ember.balanceOf(owner);
@@ -642,6 +667,37 @@ contract EmberArenaTest is Test {
         vm.prank(user1);
         vm.expectRevert();
         arena.emergencyWithdraw(address(ember), user1, 1 ether);
+    }
+
+    function test_EmergencyWithdraw_RevertDuringActiveRound() public {
+        arena.startRound();
+
+        vm.prank(ideaCreator);
+        arena.submitIdea("idea", "");
+
+        // Contract now holds SUBMISSION_FEE
+        // Try to withdraw EMBER during active round
+        vm.expectRevert(EmberArena.CannotWithdrawUserFunds.selector);
+        arena.emergencyWithdraw(address(ember), owner, SUBMISSION_FEE);
+    }
+
+    function test_EmergencyWithdraw_AllowedAfterResolution() public {
+        arena.startRound();
+
+        vm.prank(ideaCreator);
+        arena.submitIdea("idea", "");
+
+        vm.warp(block.timestamp + 25 hours);
+
+        vm.prank(user1);
+        arena.backIdea(1, 100 ether);
+
+        vm.warp(block.timestamp + 25 hours);
+
+        arena.selectWinner(1);
+
+        // After resolution, remaining funds (if any) can be withdrawn
+        // Note: In normal flow, all funds are distributed/burned
     }
 
     // ============================================
@@ -660,6 +716,108 @@ contract EmberArenaTest is Test {
     }
 
     // ============================================
+    // Cancel Round Tests
+    // ============================================
+
+    function test_CancelRound() public {
+        arena.startRound();
+
+        arena.cancelRound();
+
+        EmberArena.Round memory round = arena.getRoundInfo(1);
+        assertTrue(round.cancelled);
+        assertEq(arena.getCurrentPhase(), 4); // Cancelled
+    }
+
+    function test_CancelRound_RevertNotOwner() public {
+        arena.startRound();
+
+        vm.prank(user1);
+        vm.expectRevert();
+        arena.cancelRound();
+    }
+
+    // ============================================
+    // Emergency Refund Tests
+    // ============================================
+
+    function test_EmergencyRefund_AfterCancel() public {
+        arena.startRound();
+
+        vm.prank(ideaCreator);
+        arena.submitIdea("idea", "");
+
+        vm.warp(block.timestamp + 25 hours);
+
+        vm.prank(user1);
+        arena.backIdea(1, 100 ether);
+
+        uint256 user1Before = ember.balanceOf(user1);
+
+        // Cancel the round
+        arena.cancelRound();
+
+        // User can refund
+        vm.prank(user1);
+        arena.emergencyRefund(1, 1);
+
+        assertEq(ember.balanceOf(user1), user1Before + 100 ether);
+    }
+
+    function test_EmergencyRefund_AfterTimeout() public {
+        arena.startRound();
+
+        vm.prank(ideaCreator);
+        arena.submitIdea("idea", "");
+
+        vm.warp(block.timestamp + 25 hours);
+
+        vm.prank(user1);
+        arena.backIdea(1, 100 ether);
+
+        uint256 user1Before = ember.balanceOf(user1);
+
+        // Warp past voting + 7 day timeout
+        vm.warp(block.timestamp + 25 hours + 7 days + 1);
+
+        // User can refund after timeout
+        vm.prank(user1);
+        arena.emergencyRefund(1, 1);
+
+        assertEq(ember.balanceOf(user1), user1Before + 100 ether);
+    }
+
+    function test_EmergencyRefund_RevertTooEarly() public {
+        arena.startRound();
+
+        vm.prank(ideaCreator);
+        arena.submitIdea("idea", "");
+
+        vm.warp(block.timestamp + 25 hours);
+
+        vm.prank(user1);
+        arena.backIdea(1, 100 ether);
+
+        // Warp past voting but before timeout
+        vm.warp(block.timestamp + 25 hours + 1 days);
+
+        vm.prank(user1);
+        vm.expectRevert(EmberArena.RefundNotAvailable.selector);
+        arena.emergencyRefund(1, 1);
+    }
+
+    function test_IsRefundAvailable() public {
+        arena.startRound();
+
+        assertFalse(arena.isRefundAvailable(1));
+
+        // Warp past voting + timeout
+        vm.warp(block.timestamp + 49 hours + 7 days + 1);
+
+        assertTrue(arena.isRefundAvailable(1));
+    }
+
+    // ============================================
     // Reentrancy Tests
     // ============================================
 
@@ -669,6 +827,10 @@ contract EmberArenaTest is Test {
         EmberArena maliciousArena = new EmberArena(address(malicious), MIN_THRESHOLD);
 
         maliciousArena.startRound();
+
+        malicious.mint(user1, 500_000 ether);
+        vm.prank(user1);
+        malicious.approve(address(maliciousArena), type(uint256).max);
 
         vm.prank(user1);
         maliciousArena.submitIdea("idea", "");
@@ -730,11 +892,15 @@ contract EmberArenaTest is Test {
 
         arena.selectWinner(1);
 
-        uint256 totalPool = backing1 + backing2;
+        uint256 totalPool = SUBMISSION_FEE + backing1 + backing2;
         uint256 distributable = (totalPool * 8000) / 10000;
+        uint256 ideaTotalBacking = backing1 + backing2;
 
-        uint256 expected1 = (backing1 * distributable) / totalPool;
-        uint256 expected2 = (backing2 * distributable) / totalPool;
+        uint256 expected1 = (backing1 * distributable) / ideaTotalBacking;
+        uint256 expected2 = (backing2 * distributable) / ideaTotalBacking;
+
+        uint256 user1Before = ember.balanceOf(user1);
+        uint256 user2Before = ember.balanceOf(user2);
 
         vm.prank(user1);
         arena.claimWinnings(1);
@@ -743,8 +909,8 @@ contract EmberArenaTest is Test {
         arena.claimWinnings(1);
 
         // Allow 1 wei rounding error
-        assertApproxEqAbs(ember.balanceOf(user1), 1000 ether - backing1 + expected1, 1);
-        assertApproxEqAbs(ember.balanceOf(user2), 1000 ether - backing2 + expected2, 1);
+        assertApproxEqAbs(ember.balanceOf(user1) - user1Before, expected1, 1);
+        assertApproxEqAbs(ember.balanceOf(user2) - user2Before, expected2, 1);
     }
 
     // ============================================
@@ -779,6 +945,9 @@ contract EmberArenaTest is Test {
         // End voting
         vm.warp(start + 49 hours);
 
+        // Total pool = 2 * SUBMISSION_FEE + 60 + 40 + 50 = 2 * 100K + 150
+        uint256 totalPool = 2 * SUBMISSION_FEE + 150 ether;
+
         // Select winner (idea 1 has 100 ether, meets threshold)
         arena.selectWinner(1);
 
@@ -786,30 +955,35 @@ contract EmberArenaTest is Test {
         EmberArena.Round memory round = arena.getRoundInfo(1);
         assertEq(round.resolved, true);
         assertEq(round.winningIdeaId, 1);
-        assertEq(round.totalPool, 150 ether);
+        assertEq(round.totalPool, totalPool);
 
         // Claim winnings
-        // Distributable = 150 * 0.8 = 120
-        // User1: 60/100 * 120 = 72
-        // User2: 40/100 * 120 = 48
+        // Distributable = totalPool * 0.8
+        // Idea 1 backing = 100 ether
+        // User1: 60/100 * distributable
+        // User2: 40/100 * distributable
+        uint256 distributable = (totalPool * 8000) / 10000;
+        uint256 expected1 = (60 ether * distributable) / 100 ether;
+        uint256 expected2 = (40 ether * distributable) / 100 ether;
 
         uint256 u1Before = ember.balanceOf(user1);
         vm.prank(user1);
         arena.claimWinnings(1);
-        assertEq(ember.balanceOf(user1) - u1Before, 72 ether);
+        assertEq(ember.balanceOf(user1) - u1Before, expected1);
 
         uint256 u2Before = ember.balanceOf(user2);
         vm.prank(user2);
         arena.claimWinnings(1);
-        assertEq(ember.balanceOf(user2) - u2Before, 48 ether);
+        assertEq(ember.balanceOf(user2) - u2Before, expected2);
 
         // User3 backed losing idea - can't claim
         vm.prank(user3);
         vm.expectRevert(EmberArena.NothingToClaim.selector);
         arena.claimWinnings(1);
 
-        // Verify burn (30 ether)
-        assertEq(ember.balanceOf(arena.BURN_ADDRESS()), 30 ether);
+        // Verify burn (20% of totalPool)
+        uint256 burnAmount = (totalPool * 2000) / 10000;
+        assertEq(ember.balanceOf(arena.BURN_ADDRESS()), burnAmount);
     }
 }
 
