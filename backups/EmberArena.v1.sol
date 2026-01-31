@@ -8,27 +8,29 @@ import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 /**
- * @title Ember Arena v2
+ * @title Ember Arena
  * @author Ember 🐉 (@emberclawd)
- * @notice Decentralized Idea Backing - Back ideas with $EMBER, highest-staked idea wins automatically
- * @dev Uses 2-day cycles: Day 1 submissions, Day 2 backing. Auto-resolution by highest stake.
- * 
- * v2 Changes:
- * - REMOVED: Owner-controlled selectWinner() 
- * - ADDED: resolveRound() - anyone can call after voting ends, winner = highest stake
- * - ADDED: boostRound() - anyone can add EMBER to prize pool
- * - ADDED: Tie-breaking - multiple winners split the pot equally
- * - CHANGED: 90% to winners, 10% burned (was 80/20)
+ * @notice Idea Backing / Prediction Market - Back ideas with $EMBER, winners split the pool
+ * @dev Uses 2-day cycles: Day 1 submissions, Day 2 backing. Owner selects winner.
  * 
  * Security features:
  * - ReentrancyGuard on all state-changing functions
  * - SafeERC20 for token transfers
  * - Pausable for emergencies
- * - Ownable2Step for safe ownership transfer (admin functions only)
+ * - Ownable2Step for safe ownership transfer
  * - Pull payment pattern for winnings
  * - CEI pattern throughout
  * - Timeout refund mechanism (prevents permanent fund lock)
+ * - Restricted emergency withdraw (can't rug user funds)
  * - Submission fee prevents griefing
+ * 
+ * v2 Security Fixes (Self-Audit 3-Pass):
+ * - Added REFUND_TIMEOUT for stuck rounds
+ * - Added cancelRound() for failed rounds
+ * - Added emergencyRefund() for users
+ * - Restricted emergencyWithdraw() during active rounds
+ * - Added IDEA_SUBMISSION_FEE to prevent spam
+ * - Fixed division by zero in selectWinner
  */
 contract EmberArena is Ownable2Step, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
@@ -46,11 +48,8 @@ contract EmberArena is Ownable2Step, ReentrancyGuard, Pausable {
     /// @notice Timeout after which users can refund if round not resolved
     uint256 public constant REFUND_TIMEOUT = 7 days;
 
-    /// @notice Burn percentage in basis points (10% = 1000)
-    uint256 public constant BURN_BPS = 1000;
-
-    /// @notice Winner percentage in basis points (90% = 9000)
-    uint256 public constant WINNER_BPS = 9000;
+    /// @notice Burn percentage in basis points (20% = 2000)
+    uint256 public constant BURN_BPS = 2000;
 
     /// @notice Maximum ideas per round to prevent DoS
     uint256 public constant MAX_IDEAS_PER_ROUND = 100;
@@ -71,7 +70,7 @@ contract EmberArena is Ownable2Step, ReentrancyGuard, Pausable {
     /// @notice The $EMBER token used for backing
     IERC20 public immutable emberToken;
 
-    /// @notice Minimum total backing required for an idea to be eligible as winner
+    /// @notice Minimum total backing required for an idea to be selectable as winner
     uint256 public minBackingThreshold;
 
     /// @notice Current round ID (starts at 1)
@@ -90,11 +89,10 @@ contract EmberArena is Ownable2Step, ReentrancyGuard, Pausable {
         uint256 votingStart;
         uint256 votingEnd;
         uint256 totalPool;
-        uint256[] winningIdeaIds; // Multiple winners possible (ties)
+        uint256 winningIdeaId;
         bool resolved;
         bool cancelled;
         uint256 ideaCount;
-        uint256 boostPool; // Additional rewards from boosters
     }
 
     struct Idea {
@@ -148,8 +146,7 @@ contract EmberArena is Ownable2Step, ReentrancyGuard, Pausable {
     event RoundCancelled(uint256 indexed roundId);
     event IdeaSubmitted(uint256 indexed roundId, uint256 indexed ideaId, address indexed creator, string description, uint256 fee);
     event IdeaBacked(uint256 indexed roundId, uint256 indexed ideaId, address indexed backer, uint256 amount);
-    event RoundBoosted(uint256 indexed roundId, address indexed booster, uint256 amount);
-    event RoundResolved(uint256 indexed roundId, uint256[] winningIdeaIds, uint256 winnersCount, uint256 totalPool);
+    event WinnerSelected(uint256 indexed roundId, uint256 indexed winningIdeaId, address indexed creator, uint256 totalPool);
     event WinningsClaimed(uint256 indexed roundId, address indexed backer, uint256 amount);
     event EmergencyRefundClaimed(uint256 indexed roundId, uint256 indexed ideaId, address indexed backer, uint256 amount);
     event TokensBurned(uint256 indexed roundId, uint256 amount);
@@ -170,6 +167,7 @@ contract EmberArena is Ownable2Step, ReentrancyGuard, Pausable {
     error IdeaDoesNotExist();
     error IdeaNotInCurrentRound();
     error IdeaBelowThreshold();
+    error IdeaHasNoBacking();
     error AmountBelowMinimum();
     error NothingToClaim();
     error AlreadyClaimed();
@@ -182,17 +180,15 @@ contract EmberArena is Ownable2Step, ReentrancyGuard, Pausable {
     error ZeroAmount();
     error InvalidRoundId();
     error CannotWithdrawUserFunds();
-    error NoEligibleWinners();
-    error NotAWinner();
 
     // ============================================
     // Constructor
     // ============================================
 
     /**
-     * @notice Deploy EmberArena v2
+     * @notice Deploy EmberArena
      * @param _emberToken Address of the $EMBER ERC20 token
-     * @param _minBackingThreshold Minimum backing required for an idea to be eligible
+     * @param _minBackingThreshold Minimum backing required for an idea to win
      */
     constructor(
         address _emberToken,
@@ -227,17 +223,17 @@ contract EmberArena is Ownable2Step, ReentrancyGuard, Pausable {
         uint256 votingStart = submissionStart + SUBMISSION_DURATION;
         uint256 votingEnd = votingStart + VOTING_DURATION;
 
-        // Initialize the round (winningIdeaIds starts empty)
-        Round storage newRound = rounds[roundId];
-        newRound.roundId = roundId;
-        newRound.submissionStart = submissionStart;
-        newRound.votingStart = votingStart;
-        newRound.votingEnd = votingEnd;
-        newRound.totalPool = 0;
-        newRound.resolved = false;
-        newRound.cancelled = false;
-        newRound.ideaCount = 0;
-        newRound.boostPool = 0;
+        rounds[roundId] = Round({
+            roundId: roundId,
+            submissionStart: submissionStart,
+            votingStart: votingStart,
+            votingEnd: votingEnd,
+            totalPool: 0,
+            winningIdeaId: 0,
+            resolved: false,
+            cancelled: false,
+            ideaCount: 0
+        });
 
         emit RoundStarted(roundId, submissionStart, votingStart, votingEnd);
     }
@@ -256,6 +252,46 @@ contract EmberArena is Ownable2Step, ReentrancyGuard, Pausable {
         round.cancelled = true;
 
         emit RoundCancelled(currentRoundId);
+    }
+
+    /**
+     * @notice Select the winning idea for a round
+     * @param _ideaId ID of the winning idea
+     */
+    function selectWinner(uint256 _ideaId) external onlyOwner whenNotPaused nonReentrant {
+        if (currentRoundId == 0) revert RoundNotActive();
+
+        Round storage round = rounds[currentRoundId];
+
+        // Must be after voting ends
+        if (block.timestamp < round.votingEnd) revert VotingNotEnded();
+        if (round.resolved) revert RoundAlreadyResolved();
+        if (round.cancelled) revert RoundCancelledError();
+
+        Idea storage idea = ideas[_ideaId];
+        if (idea.ideaId == 0) revert IdeaDoesNotExist();
+        if (idea.roundId != currentRoundId) revert IdeaNotInCurrentRound();
+        if (idea.totalBacking < minBackingThreshold) revert IdeaBelowThreshold();
+        
+        // CRITICAL: Prevent division by zero in claimWinnings
+        if (idea.totalBacking == 0) revert IdeaHasNoBacking();
+
+        // Effects
+        round.winningIdeaId = _ideaId;
+        round.resolved = true;
+        idea.isWinner = true;
+
+        // Calculate burn amount
+        uint256 totalPool = round.totalPool;
+        uint256 burnAmount = (totalPool * BURN_BPS) / 10000;
+
+        // Interactions - burn tokens
+        if (burnAmount > 0) {
+            emberToken.safeTransfer(BURN_ADDRESS, burnAmount);
+            emit TokensBurned(currentRoundId, burnAmount);
+        }
+
+        emit WinnerSelected(currentRoundId, _ideaId, idea.creator, totalPool);
     }
 
     /**
@@ -309,7 +345,7 @@ contract EmberArena is Ownable2Step, ReentrancyGuard, Pausable {
         roundIdeas[currentRoundId].push(ideaId);
         round.ideaCount++;
 
-        // Charge submission fee (goes to pool, partially burned on resolution)
+        // Charge submission fee (goes to pool, burned on resolution)
         emberToken.safeTransferFrom(msg.sender, address(this), IDEA_SUBMISSION_FEE);
         round.totalPool += IDEA_SUBMISSION_FEE;
 
@@ -369,150 +405,7 @@ contract EmberArena is Ownable2Step, ReentrancyGuard, Pausable {
     }
 
     /**
-     * @notice Boost a round's prize pool
-     * @dev Anyone can add EMBER to increase rewards for winners
-     * @param _roundId ID of the round to boost
-     * @param _amount Amount of EMBER to add
-     */
-    function boostRound(uint256 _roundId, uint256 _amount) external whenNotPaused nonReentrant {
-        if (_amount == 0) revert ZeroAmount();
-        if (_roundId == 0 || _roundId > currentRoundId) revert InvalidRoundId();
-
-        Round storage round = rounds[_roundId];
-        if (round.resolved) revert RoundAlreadyResolved();
-        if (round.cancelled) revert RoundCancelledError();
-
-        // Effects
-        round.boostPool += _amount;
-        round.totalPool += _amount;
-
-        // Interactions
-        emberToken.safeTransferFrom(msg.sender, address(this), _amount);
-
-        emit RoundBoosted(_roundId, msg.sender, _amount);
-    }
-
-    /**
-     * @notice Resolve a round - determines winner(s) by highest stake
-     * @dev Anyone can call after voting ends. Highest-staked idea(s) win.
-     *      If multiple ideas have the same highest stake, they all win (tie).
-     * @param _roundId ID of the round to resolve
-     */
-    function resolveRound(uint256 _roundId) external whenNotPaused nonReentrant {
-        if (_roundId == 0 || _roundId > currentRoundId) revert InvalidRoundId();
-
-        Round storage round = rounds[_roundId];
-
-        // Must be after voting ends
-        if (block.timestamp < round.votingEnd) revert VotingNotEnded();
-        if (round.resolved) revert RoundAlreadyResolved();
-        if (round.cancelled) revert RoundCancelledError();
-
-        uint256[] storage ideaIds = roundIdeas[_roundId];
-        uint256 ideaCount = ideaIds.length;
-
-        // Find highest backing amount among eligible ideas
-        uint256 highestBacking = 0;
-        uint256 eligibleCount = 0;
-
-        for (uint256 i = 0; i < ideaCount; i++) {
-            Idea storage idea = ideas[ideaIds[i]];
-            if (idea.totalBacking >= minBackingThreshold) {
-                eligibleCount++;
-                if (idea.totalBacking > highestBacking) {
-                    highestBacking = idea.totalBacking;
-                }
-            }
-        }
-
-        // Must have at least one eligible winner
-        if (highestBacking == 0) revert NoEligibleWinners();
-
-        // Find all ideas with the highest backing (handle ties)
-        uint256[] memory winnerIds = new uint256[](ideaCount);
-        uint256 winnerCount = 0;
-
-        for (uint256 i = 0; i < ideaCount; i++) {
-            Idea storage idea = ideas[ideaIds[i]];
-            if (idea.totalBacking == highestBacking && idea.totalBacking >= minBackingThreshold) {
-                idea.isWinner = true;
-                winnerIds[winnerCount] = ideaIds[i];
-                winnerCount++;
-            }
-        }
-
-        // Copy to storage (exact size)
-        for (uint256 i = 0; i < winnerCount; i++) {
-            round.winningIdeaIds.push(winnerIds[i]);
-        }
-
-        round.resolved = true;
-
-        // Calculate and execute burn
-        uint256 totalPool = round.totalPool;
-        uint256 burnAmount = (totalPool * BURN_BPS) / 10000;
-
-        // Burn tokens
-        if (burnAmount > 0) {
-            emberToken.safeTransfer(BURN_ADDRESS, burnAmount);
-            emit TokensBurned(_roundId, burnAmount);
-        }
-
-        emit RoundResolved(_roundId, round.winningIdeaIds, winnerCount, totalPool);
-    }
-
-    /**
      * @notice Claim winnings for a resolved round
-     * @dev Winnings are split among all backers of winning idea(s)
-     *      If there are multiple winning ideas (tie), backers of any winning idea can claim
-     * @param _roundId ID of the resolved round
-     * @param _ideaId ID of the winning idea you backed
-     */
-    function claimWinnings(uint256 _roundId, uint256 _ideaId) external whenNotPaused nonReentrant {
-        if (_roundId == 0 || _roundId > currentRoundId) revert InvalidRoundId();
-
-        Round storage round = rounds[_roundId];
-        if (!round.resolved) revert RoundNotResolved();
-        if (round.cancelled) revert RoundCancelledError();
-
-        Idea storage idea = ideas[_ideaId];
-        if (!idea.isWinner) revert NotAWinner();
-
-        if (!hasBacked[_roundId][_ideaId][msg.sender]) revert NothingToClaim();
-
-        uint256 backingIdx = backerIndex[_roundId][_ideaId][msg.sender];
-        Backing storage backing = ideaBackings[_roundId][_ideaId][backingIdx];
-
-        if (backing.claimed) revert AlreadyClaimed();
-        if (backing.refunded) revert AlreadyRefunded();
-
-        // Calculate distributable pool (90% of total)
-        uint256 distributablePool = (round.totalPool * WINNER_BPS) / 10000;
-
-        // Calculate total backing across ALL winning ideas (for fair split in ties)
-        uint256 totalWinnerBacking = 0;
-        uint256 winnerCount = round.winningIdeaIds.length;
-        for (uint256 i = 0; i < winnerCount; i++) {
-            totalWinnerBacking += ideas[round.winningIdeaIds[i]].totalBacking;
-        }
-
-        // User share = (userBacking / totalWinnerBacking) * distributablePool
-        uint256 userShare = (backing.amount * distributablePool) / totalWinnerBacking;
-
-        if (userShare == 0) revert NothingToClaim();
-
-        // Effects
-        backing.claimed = true;
-
-        // Interactions
-        emberToken.safeTransfer(msg.sender, userShare);
-
-        emit WinningsClaimed(_roundId, msg.sender, userShare);
-    }
-
-    /**
-     * @notice Convenience function to claim winnings (auto-detect winning idea)
-     * @dev Finds the first winning idea the user backed and claims from it
      * @param _roundId ID of the resolved round
      */
     function claimWinnings(uint256 _roundId) external whenNotPaused nonReentrant {
@@ -522,19 +415,8 @@ contract EmberArena is Ownable2Step, ReentrancyGuard, Pausable {
         if (!round.resolved) revert RoundNotResolved();
         if (round.cancelled) revert RoundCancelledError();
 
-        // Find a winning idea that user backed
-        uint256 winnerCount = round.winningIdeaIds.length;
-        uint256 winningIdeaId = 0;
-
-        for (uint256 i = 0; i < winnerCount; i++) {
-            uint256 ideaId = round.winningIdeaIds[i];
-            if (hasBacked[_roundId][ideaId][msg.sender]) {
-                winningIdeaId = ideaId;
-                break;
-            }
-        }
-
-        if (winningIdeaId == 0) revert NothingToClaim();
+        uint256 winningIdeaId = round.winningIdeaId;
+        if (!hasBacked[_roundId][winningIdeaId][msg.sender]) revert NothingToClaim();
 
         uint256 backingIdx = backerIndex[_roundId][winningIdeaId][msg.sender];
         Backing storage backing = ideaBackings[_roundId][winningIdeaId][backingIdx];
@@ -542,17 +424,10 @@ contract EmberArena is Ownable2Step, ReentrancyGuard, Pausable {
         if (backing.claimed) revert AlreadyClaimed();
         if (backing.refunded) revert AlreadyRefunded();
 
-        // Calculate distributable pool (90% of total)
-        uint256 distributablePool = (round.totalPool * WINNER_BPS) / 10000;
-
-        // Calculate total backing across ALL winning ideas
-        uint256 totalWinnerBacking = 0;
-        for (uint256 i = 0; i < winnerCount; i++) {
-            totalWinnerBacking += ideas[round.winningIdeaIds[i]].totalBacking;
-        }
-
-        // User share = (userBacking / totalWinnerBacking) * distributablePool
-        uint256 userShare = (backing.amount * distributablePool) / totalWinnerBacking;
+        // Calculate share: (userBacking / winningIdeaBacking) * (totalPool * 80%)
+        Idea storage winningIdea = ideas[winningIdeaId];
+        uint256 distributablePool = (round.totalPool * (10000 - BURN_BPS)) / 10000;
+        uint256 userShare = (backing.amount * distributablePool) / winningIdea.totalBacking;
 
         if (userShare == 0) revert NothingToClaim();
 
@@ -651,69 +526,19 @@ contract EmberArena is Ownable2Step, ReentrancyGuard, Pausable {
 
     /**
      * @notice Get current round info
-     * @dev winningIdeaIds returned separately via getWinningIdeaIds()
+     * @return round The current round data
      */
-    function getCurrentRound() external view returns (
-        uint256 roundId,
-        uint256 submissionStart,
-        uint256 votingStart,
-        uint256 votingEnd,
-        uint256 totalPool,
-        bool resolved,
-        bool cancelled,
-        uint256 ideaCount,
-        uint256 boostPool
-    ) {
-        Round storage round = rounds[currentRoundId];
-        return (
-            round.roundId,
-            round.submissionStart,
-            round.votingStart,
-            round.votingEnd,
-            round.totalPool,
-            round.resolved,
-            round.cancelled,
-            round.ideaCount,
-            round.boostPool
-        );
+    function getCurrentRound() external view returns (Round memory) {
+        return rounds[currentRoundId];
     }
 
     /**
      * @notice Get round info by ID
      * @param _roundId Round ID to query
+     * @return round The round data
      */
-    function getRoundInfo(uint256 _roundId) external view returns (
-        uint256 roundId,
-        uint256 submissionStart,
-        uint256 votingStart,
-        uint256 votingEnd,
-        uint256 totalPool,
-        bool resolved,
-        bool cancelled,
-        uint256 ideaCount,
-        uint256 boostPool
-    ) {
-        Round storage round = rounds[_roundId];
-        return (
-            round.roundId,
-            round.submissionStart,
-            round.votingStart,
-            round.votingEnd,
-            round.totalPool,
-            round.resolved,
-            round.cancelled,
-            round.ideaCount,
-            round.boostPool
-        );
-    }
-
-    /**
-     * @notice Get winning idea IDs for a resolved round
-     * @param _roundId Round ID to query
-     * @return Array of winning idea IDs (may be multiple if tied)
-     */
-    function getWinningIdeaIds(uint256 _roundId) external view returns (uint256[] memory) {
-        return rounds[_roundId].winningIdeaIds;
+    function getRoundInfo(uint256 _roundId) external view returns (Round memory) {
+        return rounds[_roundId];
     }
 
     /**
@@ -809,11 +634,10 @@ contract EmberArena is Ownable2Step, ReentrancyGuard, Pausable {
 
     /**
      * @notice Calculate potential winnings for a backer
-     * @dev Assumes the specified idea wins (or ties for first place)
      * @param _roundId Round ID
      * @param _ideaId Idea ID
      * @param _backer Backer address
-     * @return potentialWinnings Amount they would win if this idea wins alone
+     * @return potentialWinnings Amount they would win if this idea wins
      */
     function calculatePotentialWinnings(
         uint256 _roundId,
@@ -830,64 +654,7 @@ contract EmberArena is Ownable2Step, ReentrancyGuard, Pausable {
         uint256 idx = backerIndex[_roundId][_ideaId][_backer];
         uint256 userAmount = ideaBackings[_roundId][_ideaId][idx].amount;
 
-        // If resolved, use actual winners; otherwise assume this idea wins alone
-        uint256 distributablePool = (round.totalPool * WINNER_BPS) / 10000;
-        
-        if (round.resolved) {
-            // Use actual total winner backing
-            uint256 totalWinnerBacking = 0;
-            for (uint256 i = 0; i < round.winningIdeaIds.length; i++) {
-                totalWinnerBacking += ideas[round.winningIdeaIds[i]].totalBacking;
-            }
-            if (totalWinnerBacking == 0) return 0;
-            return (userAmount * distributablePool) / totalWinnerBacking;
-        } else {
-            // Hypothetical: if this idea wins alone
-            return (userAmount * distributablePool) / idea.totalBacking;
-        }
-    }
-
-    /**
-     * @notice Get the leading idea(s) in the current round
-     * @param _roundId Round ID to check
-     * @return leadingIds Array of idea IDs currently leading (may be tied)
-     * @return highestBacking The highest backing amount
-     */
-    function getLeadingIdeas(uint256 _roundId) external view returns (
-        uint256[] memory leadingIds,
-        uint256 highestBacking
-    ) {
-        uint256[] storage ideaIds = roundIdeas[_roundId];
-        uint256 ideaCount = ideaIds.length;
-
-        if (ideaCount == 0) {
-            return (new uint256[](0), 0);
-        }
-
-        // Find highest
-        for (uint256 i = 0; i < ideaCount; i++) {
-            uint256 backing = ideas[ideaIds[i]].totalBacking;
-            if (backing > highestBacking) {
-                highestBacking = backing;
-            }
-        }
-
-        // Count ties
-        uint256 tieCount = 0;
-        for (uint256 i = 0; i < ideaCount; i++) {
-            if (ideas[ideaIds[i]].totalBacking == highestBacking && highestBacking > 0) {
-                tieCount++;
-            }
-        }
-
-        // Collect leaders
-        leadingIds = new uint256[](tieCount);
-        uint256 idx = 0;
-        for (uint256 i = 0; i < ideaCount; i++) {
-            if (ideas[ideaIds[i]].totalBacking == highestBacking && highestBacking > 0) {
-                leadingIds[idx] = ideaIds[i];
-                idx++;
-            }
-        }
+        uint256 distributablePool = (round.totalPool * (10000 - BURN_BPS)) / 10000;
+        return (userAmount * distributablePool) / idea.totalBacking;
     }
 }
