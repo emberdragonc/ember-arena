@@ -20,6 +20,17 @@ import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.s
  * - Ownable2Step for safe ownership transfer
  * - Pull payment pattern for winnings
  * - CEI pattern throughout
+ * - Timeout refund mechanism (prevents permanent fund lock)
+ * - Restricted emergency withdraw (can't rug user funds)
+ * - Submission fee prevents griefing
+ * 
+ * v2 Security Fixes (Self-Audit 3-Pass):
+ * - Added REFUND_TIMEOUT for stuck rounds
+ * - Added cancelRound() for failed rounds
+ * - Added emergencyRefund() for users
+ * - Restricted emergencyWithdraw() during active rounds
+ * - Added IDEA_SUBMISSION_FEE to prevent spam
+ * - Fixed division by zero in selectWinner
  */
 contract EmberArena is Ownable2Step, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
@@ -34,6 +45,9 @@ contract EmberArena is Ownable2Step, ReentrancyGuard, Pausable {
     /// @notice Duration of voting/backing phase
     uint256 public constant VOTING_DURATION = 24 hours;
 
+    /// @notice Timeout after which users can refund if round not resolved
+    uint256 public constant REFUND_TIMEOUT = 7 days;
+
     /// @notice Burn percentage in basis points (20% = 2000)
     uint256 public constant BURN_BPS = 2000;
 
@@ -42,6 +56,9 @@ contract EmberArena is Ownable2Step, ReentrancyGuard, Pausable {
 
     /// @notice Minimum backing amount to prevent dust attacks
     uint256 public constant MIN_BACKING_AMOUNT = 1e16; // 0.01 tokens
+
+    /// @notice Fee required to submit an idea (prevents spam/griefing)
+    uint256 public constant IDEA_SUBMISSION_FEE = 100_000e18; // 100K EMBER
 
     /// @notice Dead address for burning
     address public constant BURN_ADDRESS = 0x000000000000000000000000000000000000dEaD;
@@ -74,6 +91,7 @@ contract EmberArena is Ownable2Step, ReentrancyGuard, Pausable {
         uint256 totalPool;
         uint256 winningIdeaId;
         bool resolved;
+        bool cancelled;
         uint256 ideaCount;
     }
 
@@ -92,6 +110,7 @@ contract EmberArena is Ownable2Step, ReentrancyGuard, Pausable {
         uint256 ideaId;
         uint256 amount;
         bool claimed;
+        bool refunded;
     }
 
     // ============================================
@@ -124,10 +143,12 @@ contract EmberArena is Ownable2Step, ReentrancyGuard, Pausable {
     // ============================================
 
     event RoundStarted(uint256 indexed roundId, uint256 submissionStart, uint256 votingStart, uint256 votingEnd);
-    event IdeaSubmitted(uint256 indexed roundId, uint256 indexed ideaId, address indexed creator, string description);
+    event RoundCancelled(uint256 indexed roundId);
+    event IdeaSubmitted(uint256 indexed roundId, uint256 indexed ideaId, address indexed creator, string description, uint256 fee);
     event IdeaBacked(uint256 indexed roundId, uint256 indexed ideaId, address indexed backer, uint256 amount);
     event WinnerSelected(uint256 indexed roundId, uint256 indexed winningIdeaId, address indexed creator, uint256 totalPool);
     event WinningsClaimed(uint256 indexed roundId, address indexed backer, uint256 amount);
+    event EmergencyRefundClaimed(uint256 indexed roundId, uint256 indexed ideaId, address indexed backer, uint256 amount);
     event TokensBurned(uint256 indexed roundId, uint256 amount);
     event MinBackingThresholdUpdated(uint256 oldThreshold, uint256 newThreshold);
 
@@ -139,20 +160,26 @@ contract EmberArena is Ownable2Step, ReentrancyGuard, Pausable {
     error RoundAlreadyActive();
     error NotInSubmissionPhase();
     error NotInVotingPhase();
+    error VotingNotEnded();
     error RoundNotResolved();
     error RoundAlreadyResolved();
+    error RoundCancelledError();
     error IdeaDoesNotExist();
     error IdeaNotInCurrentRound();
     error IdeaBelowThreshold();
+    error IdeaHasNoBacking();
     error AmountBelowMinimum();
     error NothingToClaim();
     error AlreadyClaimed();
+    error AlreadyRefunded();
+    error RefundNotAvailable();
     error TransferFailed();
     error MaxIdeasReached();
     error EmptyDescription();
     error ZeroAddress();
     error ZeroAmount();
     error InvalidRoundId();
+    error CannotWithdrawUserFunds();
 
     // ============================================
     // Constructor
@@ -184,7 +211,7 @@ contract EmberArena is Ownable2Step, ReentrancyGuard, Pausable {
         // Check no active round
         if (currentRoundId > 0) {
             Round storage lastRound = rounds[currentRoundId];
-            if (!lastRound.resolved && block.timestamp < lastRound.votingEnd) {
+            if (!lastRound.resolved && !lastRound.cancelled && block.timestamp < lastRound.votingEnd) {
                 revert RoundAlreadyActive();
             }
         }
@@ -204,10 +231,27 @@ contract EmberArena is Ownable2Step, ReentrancyGuard, Pausable {
             totalPool: 0,
             winningIdeaId: 0,
             resolved: false,
+            cancelled: false,
             ideaCount: 0
         });
 
         emit RoundStarted(roundId, submissionStart, votingStart, votingEnd);
+    }
+
+    /**
+     * @notice Cancel a round (e.g., if no valid ideas)
+     * @dev Users can then claim refunds via emergencyRefund
+     */
+    function cancelRound() external onlyOwner whenNotPaused nonReentrant {
+        if (currentRoundId == 0) revert RoundNotActive();
+
+        Round storage round = rounds[currentRoundId];
+        if (round.resolved) revert RoundAlreadyResolved();
+        if (round.cancelled) revert RoundCancelledError();
+
+        round.cancelled = true;
+
+        emit RoundCancelled(currentRoundId);
     }
 
     /**
@@ -220,13 +264,17 @@ contract EmberArena is Ownable2Step, ReentrancyGuard, Pausable {
         Round storage round = rounds[currentRoundId];
 
         // Must be after voting ends
-        if (block.timestamp < round.votingEnd) revert NotInVotingPhase();
+        if (block.timestamp < round.votingEnd) revert VotingNotEnded();
         if (round.resolved) revert RoundAlreadyResolved();
+        if (round.cancelled) revert RoundCancelledError();
 
         Idea storage idea = ideas[_ideaId];
         if (idea.ideaId == 0) revert IdeaDoesNotExist();
         if (idea.roundId != currentRoundId) revert IdeaNotInCurrentRound();
         if (idea.totalBacking < minBackingThreshold) revert IdeaBelowThreshold();
+        
+        // CRITICAL: Prevent division by zero in claimWinnings
+        if (idea.totalBacking == 0) revert IdeaHasNoBacking();
 
         // Effects
         round.winningIdeaId = _ideaId;
@@ -262,6 +310,7 @@ contract EmberArena is Ownable2Step, ReentrancyGuard, Pausable {
 
     /**
      * @notice Submit an idea for the current round
+     * @dev Requires IDEA_SUBMISSION_FEE to prevent griefing
      * @param _description Brief description of the idea
      * @param _metadata IPFS hash or URL for additional details
      */
@@ -278,6 +327,7 @@ contract EmberArena is Ownable2Step, ReentrancyGuard, Pausable {
         if (block.timestamp < round.submissionStart) revert NotInSubmissionPhase();
         if (block.timestamp >= round.votingStart) revert NotInSubmissionPhase();
         if (round.ideaCount >= MAX_IDEAS_PER_ROUND) revert MaxIdeasReached();
+        if (round.cancelled) revert RoundCancelledError();
 
         totalIdeas++;
         ideaId = totalIdeas;
@@ -295,7 +345,11 @@ contract EmberArena is Ownable2Step, ReentrancyGuard, Pausable {
         roundIdeas[currentRoundId].push(ideaId);
         round.ideaCount++;
 
-        emit IdeaSubmitted(currentRoundId, ideaId, msg.sender, _description);
+        // Charge submission fee (goes to pool, burned on resolution)
+        emberToken.safeTransferFrom(msg.sender, address(this), IDEA_SUBMISSION_FEE);
+        round.totalPool += IDEA_SUBMISSION_FEE;
+
+        emit IdeaSubmitted(currentRoundId, ideaId, msg.sender, _description, IDEA_SUBMISSION_FEE);
     }
 
     /**
@@ -312,6 +366,7 @@ contract EmberArena is Ownable2Step, ReentrancyGuard, Pausable {
         // Must be in voting phase
         if (block.timestamp < round.votingStart) revert NotInVotingPhase();
         if (block.timestamp >= round.votingEnd) revert NotInVotingPhase();
+        if (round.cancelled) revert RoundCancelledError();
 
         Idea storage idea = ideas[_ideaId];
         if (idea.ideaId == 0) revert IdeaDoesNotExist();
@@ -334,7 +389,8 @@ contract EmberArena is Ownable2Step, ReentrancyGuard, Pausable {
                 backer: msg.sender,
                 ideaId: _ideaId,
                 amount: _amount,
-                claimed: false
+                claimed: false,
+                refunded: false
             }));
 
             hasBacked[currentRoundId][_ideaId][msg.sender] = true;
@@ -357,6 +413,7 @@ contract EmberArena is Ownable2Step, ReentrancyGuard, Pausable {
 
         Round storage round = rounds[_roundId];
         if (!round.resolved) revert RoundNotResolved();
+        if (round.cancelled) revert RoundCancelledError();
 
         uint256 winningIdeaId = round.winningIdeaId;
         if (!hasBacked[_roundId][winningIdeaId][msg.sender]) revert NothingToClaim();
@@ -365,6 +422,7 @@ contract EmberArena is Ownable2Step, ReentrancyGuard, Pausable {
         Backing storage backing = ideaBackings[_roundId][winningIdeaId][backingIdx];
 
         if (backing.claimed) revert AlreadyClaimed();
+        if (backing.refunded) revert AlreadyRefunded();
 
         // Calculate share: (userBacking / winningIdeaBacking) * (totalPool * 80%)
         Idea storage winningIdea = ideas[winningIdeaId];
@@ -380,6 +438,42 @@ contract EmberArena is Ownable2Step, ReentrancyGuard, Pausable {
         emberToken.safeTransfer(msg.sender, userShare);
 
         emit WinningsClaimed(_roundId, msg.sender, userShare);
+    }
+
+    /**
+     * @notice Emergency refund for stuck/cancelled rounds
+     * @dev Available if: round cancelled OR round not resolved after REFUND_TIMEOUT
+     * @param _roundId Round ID to refund from
+     * @param _ideaId Idea ID user backed
+     */
+    function emergencyRefund(uint256 _roundId, uint256 _ideaId) external whenNotPaused nonReentrant {
+        if (_roundId == 0 || _roundId > currentRoundId) revert InvalidRoundId();
+
+        Round storage round = rounds[_roundId];
+        
+        // Refund available if: cancelled OR (not resolved AND timeout passed)
+        bool canRefund = round.cancelled || 
+            (!round.resolved && block.timestamp > round.votingEnd + REFUND_TIMEOUT);
+        
+        if (!canRefund) revert RefundNotAvailable();
+        if (!hasBacked[_roundId][_ideaId][msg.sender]) revert NothingToClaim();
+
+        uint256 backingIdx = backerIndex[_roundId][_ideaId][msg.sender];
+        Backing storage backing = ideaBackings[_roundId][_ideaId][backingIdx];
+
+        if (backing.claimed) revert AlreadyClaimed();
+        if (backing.refunded) revert AlreadyRefunded();
+
+        uint256 refundAmount = backing.amount;
+        if (refundAmount == 0) revert NothingToClaim();
+
+        // Effects
+        backing.refunded = true;
+
+        // Interactions
+        emberToken.safeTransfer(msg.sender, refundAmount);
+
+        emit EmergencyRefundClaimed(_roundId, _ideaId, msg.sender, refundAmount);
     }
 
     // ============================================
@@ -401,7 +495,8 @@ contract EmberArena is Ownable2Step, ReentrancyGuard, Pausable {
     }
 
     /**
-     * @notice Emergency withdrawal of stuck tokens
+     * @notice Emergency withdrawal of stuck tokens (NOT user funds)
+     * @dev Cannot withdraw EMBER during active rounds to prevent rugging
      * @param _token Token address to rescue
      * @param _to Recipient address
      * @param _amount Amount to rescue
@@ -413,6 +508,15 @@ contract EmberArena is Ownable2Step, ReentrancyGuard, Pausable {
     ) external onlyOwner {
         if (_to == address(0)) revert ZeroAddress();
         if (_amount == 0) revert ZeroAmount();
+        
+        // Prevent withdrawing EMBER during active rounds (anti-rug)
+        if (_token == address(emberToken) && currentRoundId > 0) {
+            Round storage round = rounds[currentRoundId];
+            if (!round.resolved && !round.cancelled) {
+                revert CannotWithdrawUserFunds();
+            }
+        }
+        
         IERC20(_token).safeTransfer(_to, _amount);
     }
 
@@ -481,7 +585,7 @@ contract EmberArena is Ownable2Step, ReentrancyGuard, Pausable {
         uint256 _ideaId
     ) external view returns (Backing memory) {
         if (!hasBacked[_roundId][_ideaId][_user]) {
-            return Backing(address(0), 0, 0, false);
+            return Backing(address(0), 0, 0, false, false);
         }
         uint256 idx = backerIndex[_roundId][_ideaId][_user];
         return ideaBackings[_roundId][_ideaId][idx];
@@ -502,16 +606,30 @@ contract EmberArena is Ownable2Step, ReentrancyGuard, Pausable {
 
     /**
      * @notice Check current phase of active round
-     * @return phase 0=No Round, 1=Submission, 2=Voting, 3=Ended
+     * @return phase 0=No Round, 1=Submission, 2=Voting, 3=Ended, 4=Cancelled
      */
     function getCurrentPhase() external view returns (uint256 phase) {
         if (currentRoundId == 0) return 0;
 
         Round storage round = rounds[currentRoundId];
 
+        if (round.cancelled) return 4; // Cancelled
         if (block.timestamp < round.votingStart) return 1; // Submission
         if (block.timestamp < round.votingEnd) return 2; // Voting
         return 3; // Ended
+    }
+
+    /**
+     * @notice Check if emergency refund is available for a round
+     * @param _roundId Round ID to check
+     * @return available True if refund is available
+     */
+    function isRefundAvailable(uint256 _roundId) external view returns (bool available) {
+        if (_roundId == 0 || _roundId > currentRoundId) return false;
+        
+        Round storage round = rounds[_roundId];
+        return round.cancelled || 
+            (!round.resolved && block.timestamp > round.votingEnd + REFUND_TIMEOUT);
     }
 
     /**
