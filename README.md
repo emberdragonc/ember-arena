@@ -44,10 +44,11 @@ PAYOUTS:
 
 ## Contracts
 
-| Contract | Address (Base Sepolia) |
+| Contract | Address |
 |----------|------------------------|
-| EmberArena | `0xcB1Aa33b4f8f4E2e113C3c41c92e59DF9Bfe6e9c` |
-| MockEMBER | `0xFd3F1cbd832127f878803Bdbf0e51d7C87C75b34` |
+| EmberArena (Mainnet) | `0x183f1d05E956CEf4E8Bd46441Fd7Cd557eac0051` |
+| EmberArena (Testnet) | `0xcB1Aa33b4f8f4E2e113C3c41c92e59DF9Bfe6e9c` |
+| EMBER Token | `0x7FfBE850D2d45242efdb914D7d4Dbb682d0C9B07` |
 
 ## Security
 
